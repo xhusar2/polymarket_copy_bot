@@ -1,0 +1,12 @@
+services:
+  copy_trader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_FILE: /data/copy_state.json
+    volumes:
+      - trader_state:/data
+
+volumes:
+  trader_state:

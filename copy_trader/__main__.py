@@ -10,6 +10,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     p = argparse.ArgumentParser(description="Polymarket copy trader (CLOB mirror)")
     p.add_argument(
         "--target",

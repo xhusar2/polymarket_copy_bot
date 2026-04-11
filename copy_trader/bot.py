@@ -210,6 +210,7 @@ class Settings:
     state_path: Path
     seen_cap: int
     max_buy_usd: float | None
+    min_buy_usd: float | None
     user_agent: str
     skip_balance_check: bool
     refresh_balance_before_buy: bool
@@ -494,6 +495,14 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
         notion = leader_size * leader_price * settings.scale
         if settings.max_buy_usd is not None:
             notion = min(notion, settings.max_buy_usd)
+        if settings.min_buy_usd is not None and notion < settings.min_buy_usd - 1e-9:
+            log.debug(
+                "skip BUY below MIN_BUY_USD token=%s usd=%.4f min=%s",
+                token_id[:16],
+                notion,
+                settings.min_buy_usd,
+            )
+            return
         if min_sz:
             min_notional = min_sz * leader_price
             if notion < min_notional:
@@ -721,6 +730,23 @@ def settings_from_env(
         )
         raise SystemExit(2)
 
+    max_buy = (
+        float(os.environ["MAX_BUY_USD"]) if os.environ.get("MAX_BUY_USD") else None
+    )
+    min_buy = (
+        float(os.environ["MIN_BUY_USD"]) if os.environ.get("MIN_BUY_USD") else None
+    )
+    if (
+        max_buy is not None
+        and min_buy is not None
+        and min_buy > max_buy + 1e-9
+    ):
+        log.warning(
+            "MIN_BUY_USD (%s) > MAX_BUY_USD (%s) — every BUY will be skipped",
+            min_buy,
+            max_buy,
+        )
+
     return Settings(
         target=target,
         private_key=pk,
@@ -733,9 +759,8 @@ def settings_from_env(
         dry_run=dry,
         state_path=Path(os.environ.get("STATE_FILE", "copy_state.json")),
         seen_cap=int(os.environ.get("SEEN_CAP", "8000")),
-        max_buy_usd=float(os.environ["MAX_BUY_USD"])
-        if os.environ.get("MAX_BUY_USD")
-        else None,
+        max_buy_usd=max_buy,
+        min_buy_usd=min_buy,
         user_agent=os.environ.get("DATA_API_USER_AGENT", "PolymarketCopyTrader/1.0"),
         skip_balance_check=os.environ.get("SKIP_BALANCE_CHECK", "").lower()
         in ("1", "true", "yes"),

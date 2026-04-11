@@ -11,8 +11,16 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from py_clob_client.exceptions import PolyApiException
 
 log = logging.getLogger("copy_trader")
+
+# One-time hint when CLOB reports ~0 USDC collateral (usually wrong POLYMARKET_FUNDER).
+_logged_usdc_zero_hint = False
+# One-time hint for HTTP 400 invalid signature on post_order.
+_invalid_signature_hint = False
+# One-time hint for HTTP 400 insufficient balance / allowance on post_order.
+_insufficient_balance_hint = False
 
 DATA_API = "https://data-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -84,6 +92,89 @@ def save_seen(path: Path, seen: set[str], cap: int) -> None:
     path.write_text(json.dumps({"seen": trimmed}, indent=0))
 
 
+def _poly_error_text(exc: PolyApiException) -> str:
+    m = exc.error_msg
+    if isinstance(m, dict):
+        return str(m.get("error", m))
+    return str(m)
+
+
+def _is_invalid_signature_error(exc: BaseException) -> bool:
+    if isinstance(exc, PolyApiException):
+        return "invalid signature" in _poly_error_text(exc).lower()
+    return "invalid signature" in str(exc).lower()
+
+
+def _is_insufficient_balance_error(exc: BaseException) -> bool:
+    if isinstance(exc, PolyApiException):
+        t = _poly_error_text(exc).lower()
+    else:
+        t = str(exc).lower()
+    return "not enough balance" in t or (
+        "insufficient" in t and ("balance" in t or "allowance" in t)
+    )
+
+
+def _log_insufficient_balance_hint_once(settings: Settings) -> None:
+    global _insufficient_balance_hint
+    if _insufficient_balance_hint:
+        return
+    _insufficient_balance_hint = True
+    extra = (
+        " SKIP_BALANCE_CHECK=1 bypassed preflight — turn it off to skip orders before post."
+        if settings.skip_balance_check
+        else ""
+    )
+    log.warning(
+        "CLOB 'not enough balance / allowance' — collateral for this signer/funder is 0 on-chain "
+        "or allowance missing. Deposit USDC to Polymarket for this account; set POLYMARKET_FUNDER to "
+        "the wallet that actually holds USDC; approve USDC for the CLOB in the UI if needed.%s",
+        extra,
+    )
+
+
+def _parse_optional_evm_address(env_name: str, raw: str | None) -> str | None:
+    """Return normalized 0x-prefixed lowercase address, or None if unset."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if not s.startswith("0x"):
+        raise SystemExit(f"{env_name} must start with 0x (got {s[:24]}…)")
+    body = s[2:]
+    if len(body) != len(body.encode("ascii")):
+        raise SystemExit(f"{env_name} must be ASCII hex")
+    if not all(c in "0123456789abcdefABCDEF" for c in body):
+        raise SystemExit(f"{env_name} must be hex digits only (after 0x)")
+    if len(body) == 64:
+        raise SystemExit(
+            f"{env_name} has 64 hex characters after 0x — that is a **private key** length. "
+            "Set it to your Polymarket **proxy wallet address** (40 hex chars / 20 bytes), not PRIVATE_KEY."
+        )
+    if len(body) != 40:
+        raise SystemExit(
+            f"{env_name} must be an EVM address: exactly 40 hex characters after 0x "
+            f"(got {len(body)}). Example: 0xabc…def (42 chars total)."
+        )
+    return "0x" + body.lower()
+
+
+def _log_invalid_signature_hint_once() -> None:
+    global _invalid_signature_hint
+    if _invalid_signature_hint:
+        return
+    _invalid_signature_hint = True
+    log.warning(
+        "CLOB 'invalid signature' — EIP-712 maker does not match this account model. "
+        "(1) PRIVATE_KEY: use the key exported from https://polymarket.com/settings if you use email/Magic. "
+        "(2) Types 1 (Magic) & 2 (browser): POLYMARKET_FUNDER must be the **proxy** in Profile — not the EOA. "
+        "Type 0 (EOA): funder must equal signer; no proxy. "
+        "(3) Try POLYMARKET_SIGNATURE_TYPE 1 vs 2 vs 0 to match how you created the account. "
+        "See https://docs.polymarket.com/developers/CLOB/trades/overview#signature-types"
+    )
+
+
 def fetch_leader_trades(
     client: httpx.Client,
     user: str,
@@ -121,6 +212,7 @@ class Settings:
     max_buy_usd: float | None
     user_agent: str
     skip_balance_check: bool
+    refresh_balance_before_buy: bool
     refresh_balance_before_sell: bool
     market_filter_mode: str
     market_filter_keywords: tuple[str, ...]
@@ -135,10 +227,30 @@ def build_clob_client(settings: Settings):
     temp = ClobClient(CLOB_HOST, key=settings.private_key, chain_id=CHAIN_ID)
     creds = temp.create_or_derive_api_creds()
 
-    funder = settings.funder or temp.get_address()
+    signer_addr = temp.get_address()
+    funder = settings.funder or signer_addr
     sig = settings.signature_type
 
-    return ClobClient(
+    if sig in (1, 2) and funder.lower() == signer_addr.lower():
+        log.warning(
+            "POLYMARKET_SIGNATURE_TYPE=%s (Polymarket proxy account: Magic=1, browser=2) but "
+            "funder equals signer EOA — this usually causes CLOB 'invalid signature'. "
+            "Set POLYMARKET_FUNDER to the **proxy wallet** from the Polymarket profile dropdown "
+            "(where your USDC sits), not the exported EOA. "
+            "Use POLYMARKET_SIGNATURE_TYPE=0 only for a standalone EOA with no Polymarket proxy.",
+            sig,
+        )
+    if sig == 0 and funder.lower() != signer_addr.lower():
+        log.warning(
+            "POLYMARKET_SIGNATURE_TYPE=0 (EOA) but funder (%s) != signer (%s) — "
+            "this causes CLOB 'invalid signature'. For type 0, unset POLYMARKET_FUNDER or set it to the "
+            "signer address. If USDC is on a Polymarket proxy, use POLYMARKET_SIGNATURE_TYPE=2 and "
+            "POLYMARKET_FUNDER=proxy.",
+            funder,
+            signer_addr,
+        )
+
+    client = ClobClient(
         CLOB_HOST,
         key=settings.private_key,
         chain_id=CHAIN_ID,
@@ -146,6 +258,75 @@ def build_clob_client(settings: Settings):
         signature_type=sig,
         funder=funder,
     )
+    log.info(
+        "CLOB signer=%s funder=%s POLYMARKET_SIGNATURE_TYPE=%s",
+        client.get_address(),
+        funder,
+        sig,
+    )
+    return client
+
+
+def clob_identity_check(settings: Settings) -> int:
+    """
+    Print signer/funder and CLOB-reported USDC collateral (same path as the bot).
+    Use this to verify PRIVATE_KEY, POLYMARKET_FUNDER, and POLYMARKET_SIGNATURE_TYPE
+    match what Polymarket's API sees — independent of on-chain explorers or the website
+    if the funder address differs.
+    """
+    if settings.dry_run:
+        print(
+            "DRY_RUN=1 — unset DRY_RUN and set PRIVATE_KEY to query the CLOB.",
+            file=sys.stderr,
+        )
+        return 2
+    if not settings.private_key:
+        print("PRIVATE_KEY is required for --check.", file=sys.stderr)
+        return 2
+
+    clob = build_clob_client(settings)
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+    refreshed = False
+    try:
+        clob.update_balance_allowance(params)
+        refreshed = True
+    except Exception as e:
+        print(f"update_balance_allowance: {e}", file=sys.stderr)
+
+    resp = clob.get_balance_allowance(params)
+    scale = 1e6
+    bal_raw = resp.get("balance")
+    allowances = resp.get("allowances")
+    bal = _fixed_int_to_human(bal_raw, scale)
+    allow_h = _max_allowance_human(allowances, scale)
+
+    signer = clob.get_address()
+    resolved_funder = settings.funder if settings.funder else signer
+
+    print("--- Polymarket CLOB (same as bot) ---")
+    print(f"signer from PRIVATE_KEY:     {signer}")
+    print(f"funder (collateral wallet): {resolved_funder}")
+    print(f"POLYMARKET_SIGNATURE_TYPE:  {settings.signature_type}")
+    print(f"SKIP_BALANCE_CHECK:         {settings.skip_balance_check}")
+    print(f"cache refresh attempted:    {refreshed}")
+    print(f"USDC balance (CLOB):        {bal:.6f}  (raw balance field: {bal_raw!r})")
+    print(f"allowances (raw):           {allowances!r}")
+    print(f"max spender allowance ~:    {allow_h:.6f}")
+    if bal < 1e-6:
+        print(
+            "\nCLOB sees ~0 USDC. If the website shows funds, compare Profile/deposit address "
+            "to `funder` above — they must match for API orders. Try POLYMARKET_SIGNATURE_TYPE "
+            "0 (EOA, funder=signer) vs 1/2 (proxy as funder) until this balance matches expectations."
+        )
+    elif settings.signature_type in (1, 2) and resolved_funder.lower() == signer.lower():
+        print(
+            "\nFor signature types 1 & 2, `funder` should be your Polymarket **proxy** (profile), "
+            "usually different from the exported key's EOA — otherwise orders often fail with "
+            "'invalid signature' even if balance looks fine here."
+        )
+    return 0
 
 
 def _fixed_int_to_human(raw: Any, scale: float) -> float:
@@ -178,6 +359,8 @@ def trade_affordable(
     BUY: collateral USDC balance + allowance vs USD notional.
     SELL: conditional token balance + allowance vs share size.
     """
+    global _logged_usdc_zero_hint
+
     if settings.skip_balance_check:
         return True
 
@@ -188,18 +371,30 @@ def trade_affordable(
 
     if side == "BUY":
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        if settings.refresh_balance_before_buy:
+            try:
+                clob.update_balance_allowance(params)
+            except Exception as e:
+                log.debug("update_balance_allowance collateral: %s", e)
         resp = clob.get_balance_allowance(params)
         bal = _fixed_int_to_human(resp.get("balance"), scale)
         allow = _max_allowance_human(resp.get("allowances"), scale)
         if bal + eps < amount:
-            log.warning(
+            if not _logged_usdc_zero_hint and bal <= eps:
+                _logged_usdc_zero_hint = True
+                log.warning(
+                    "CLOB reports ~0 USDC collateral for signer/funder above — "
+                    "set POLYMARKET_FUNDER to your Polymarket proxy if funds are there; "
+                    "per-trade balance skips log at DEBUG"
+                )
+            log.debug(
                 "skip BUY insufficient USDC balance need=%.4f have=%.4f",
                 amount,
                 bal,
             )
             return False
         if allow + eps < amount:
-            log.warning(
+            log.debug(
                 "skip BUY insufficient USDC allowance need=%.4f max_spender=%.4f",
                 amount,
                 allow,
@@ -219,7 +414,7 @@ def trade_affordable(
     raw_allow = resp.get("allowances")
     allow = _max_allowance_human(raw_allow, scale)
     if bal + eps < amount:
-        log.warning(
+        log.debug(
             "skip SELL insufficient outcome balance need=%.6f have=%.6f",
             amount,
             bal,
@@ -227,7 +422,7 @@ def trade_affordable(
         return False
     if isinstance(raw_allow, dict) and raw_allow:
         if allow + eps < amount:
-            log.warning(
+            log.debug(
                 "skip SELL insufficient token allowance need=%.6f max_spender=%.6f",
                 amount,
                 allow,
@@ -271,7 +466,7 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
         return
 
     if not trade_matches_market_filter(trade, settings):
-        log.info(
+        log.debug(
             "skip market filter (%s) title=%s",
             settings.market_filter_mode,
             (trade.get("title") or "")[:80],
@@ -288,7 +483,7 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
     if side == "SELL":
         amount = scaled_shares
         if min_sz and amount < min_sz:
-            log.info(
+            log.debug(
                 "skip SELL below min_order_size token=%s amount=%s min=%s",
                 token_id[:16],
                 amount,
@@ -302,7 +497,7 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
         if min_sz:
             min_notional = min_sz * leader_price
             if notion < min_notional:
-                log.info(
+                log.debug(
                     "skip BUY below min notional token=%s usd=%s min~=%s",
                     token_id[:16],
                     notion,
@@ -316,16 +511,22 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
             return
 
     title = trade.get("title") or ""
-    log.info(
-        "mirror %s %s shares~=%.4f token=%s… market=%s",
+    log.debug(
+        "submit %s %s shares~=%.4f token=%s… | %s",
         side,
         f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
         scaled_shares,
         token_id[:20],
-        title[:60],
+        (title or "")[:60],
     )
 
     if settings.dry_run:
+        log.info(
+            "[dry_run] would %s %s | %s",
+            side,
+            f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
+            (title or "")[:50],
+        )
         return
 
     mo = MarketOrderArgs(
@@ -335,9 +536,42 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
         price=0,
         order_type=OrderType.FOK,
     )
-    signed = clob.create_market_order(mo)
-    resp = clob.post_order(signed, orderType=OrderType.FOK)
-    log.info("posted %s", resp)
+    try:
+        signed = clob.create_market_order(mo)
+        resp = clob.post_order(signed, orderType=OrderType.FOK)
+        oid = resp.get("orderID") if isinstance(resp, dict) else resp
+        log.info(
+            "filled %s %s | order=%s | %s",
+            side,
+            f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
+            oid,
+            (title or "")[:55],
+        )
+        log.debug("posted %s", resp)
+    except PolyApiException as e:
+        if _is_invalid_signature_error(e):
+            _log_invalid_signature_hint_once()
+            log.debug("post_order: %s", e)
+            return
+        if _is_insufficient_balance_error(e):
+            _log_insufficient_balance_hint_once(settings)
+            log.debug(
+                "skip %s insufficient balance/allowance post_order: %s",
+                side,
+                _poly_error_text(e) if isinstance(e, PolyApiException) else e,
+            )
+            return
+        raise
+    except Exception as e:
+        # py-clob-client: empty book or not enough ask depth to fill FOK BUY/SELL notional
+        if str(e) == "no match":
+            log.warning(
+                "skip %s FOK: no liquidity to match size (empty book or insufficient depth) token=%s…",
+                side,
+                token_id[:20],
+            )
+            return
+        raise
 
 
 def run_loop(settings: Settings) -> None:
@@ -384,6 +618,8 @@ def run_loop(settings: Settings) -> None:
                         continue
                     try:
                         mirror_trade(clob, t, settings)
+                    except PolyApiException as e:
+                        log.exception("mirror failed: %s", e)
                     except Exception as e:
                         log.exception("mirror failed: %s", e)
                     seen.add(fp)
@@ -395,13 +631,66 @@ def run_loop(settings: Settings) -> None:
         time.sleep(settings.poll_interval)
 
 
-def settings_from_env(target_override: str | None) -> Settings:
+def replay_last_trades(settings: Settings, limit: int) -> None:
+    """
+    Fetch up to `limit` recent leader trades and run mirror_trade for each (oldest first).
+    Fingerprints are merged into seen so the main loop will not duplicate them immediately.
+    """
+    if limit < 1:
+        raise SystemExit("--replay N requires N >= 1")
+    if limit > 10000:
+        log.warning("capping replay at 10000 (Data API max)")
+        limit = 10000
+
+    headers = {"User-Agent": settings.user_agent}
+    http = httpx.Client(headers=headers, timeout=30.0)
+    seen = load_seen(settings.state_path, settings.seen_cap)
+
+    clob = None
+    if not settings.dry_run:
+        clob = build_clob_client(settings)
+    if clob is None:
+        from py_clob_client.client import ClobClient
+
+        clob = ClobClient(CLOB_HOST, chain_id=CHAIN_ID)
+
+    trades = fetch_leader_trades(
+        http, settings.target, limit, settings.taker_only
+    )
+    by_time = sorted(trades, key=lambda t: int(t.get("timestamp") or 0))
+
+    log.info(
+        "replay: mirroring %d trade(s) for %s (dry_run=%s)",
+        len(by_time),
+        settings.target,
+        settings.dry_run,
+    )
+
+    for t in by_time:
+        fp = trade_fingerprint(t)
+        try:
+            mirror_trade(clob, t, settings)
+        except Exception as e:
+            log.exception("replay mirror failed: %s", e)
+        seen.add(fp)
+
+    save_seen(settings.state_path, seen, settings.seen_cap)
+    log.info("replay: done; state saved (%d fingerprints in store)", len(seen))
+
+
+def settings_from_env(
+    target_override: str | None = None,
+    *,
+    require_copy_target: bool = True,
+) -> Settings:
     load_dotenv()
 
     target = target_override or os.environ.get("COPY_TARGET_WALLET", "").strip()
     if not target:
-        print("Set COPY_TARGET_WALLET or pass --target 0x…", file=sys.stderr)
-        raise SystemExit(2)
+        if require_copy_target:
+            print("Set COPY_TARGET_WALLET or pass --target 0x…", file=sys.stderr)
+            raise SystemExit(2)
+        target = "0x0000000000000000000000000000000000000001"
 
     dry = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
     pk = os.environ.get("PRIVATE_KEY", "").strip() or None
@@ -412,7 +701,9 @@ def settings_from_env(target_override: str | None) -> Settings:
         raise SystemExit(2)
 
     sig = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "2"))
-    funder = os.environ.get("POLYMARKET_FUNDER", "").strip() or None
+    funder = _parse_optional_evm_address(
+        "POLYMARKET_FUNDER", os.environ.get("POLYMARKET_FUNDER", "").strip() or None
+    )
 
     mf = os.environ.get("COPY_MARKET_FILTER", "weather").strip().lower()
     if mf not in ("all", "weather", "keywords"):
@@ -447,6 +738,10 @@ def settings_from_env(target_override: str | None) -> Settings:
         else None,
         user_agent=os.environ.get("DATA_API_USER_AGENT", "PolymarketCopyTrader/1.0"),
         skip_balance_check=os.environ.get("SKIP_BALANCE_CHECK", "").lower()
+        in ("1", "true", "yes"),
+        refresh_balance_before_buy=os.environ.get(
+            "REFRESH_BALANCE_BEFORE_BUY", ""
+        ).lower()
         in ("1", "true", "yes"),
         refresh_balance_before_sell=os.environ.get(
             "REFRESH_BALANCE_BEFORE_SELL", ""

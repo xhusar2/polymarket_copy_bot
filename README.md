@@ -40,6 +40,16 @@ Override leader for one run:
 .venv/bin/python -m copy_trader --target 0xLeaderAddress
 ```
 
+### Replay last N trades once
+
+Fetches the latest **N** rows from the Data API (default **100**), runs the same mirror path as the live loop (filters, sizing, balance check), and **merges** fingerprints into `STATE_FILE` so the next poll does not fire duplicates.
+
+```bash
+.venv/bin/python -m copy_trader --replay       # last 100
+.venv/bin/python -m copy_trader --replay 50  # last 50
+.venv/bin/python -m copy_trader --replay --follow   # replay then keep polling
+```
+
 ## Docker
 
 ```bash
@@ -55,7 +65,10 @@ One-off with CLI args:
 
 ```bash
 docker compose run --rm copy_trader --target 0xLeaderAddress
+docker compose run --rm copy_trader --replay 100
 ```
+
+`docker compose up` does **not** pass `--replay`; use **`docker compose run`** for one-shot replay (add `--follow` to keep polling after replay).
 
 ## Environment variables
 
@@ -79,9 +92,30 @@ Copy **`.env.example`** to **`.env`** and adjust. Important entries:
 | `SKIP_BALANCE_CHECK` | `1` to skip CLOB balance/allowance pre-check |
 | `REFRESH_BALANCE_BEFORE_SELL` | `1` to refresh conditional balance cache before SELL check |
 | `DATA_API_USER_AGENT` | Required for Data API (403 without a UA) |
+| `LOG_LEVEL` | `INFO` (default) or `DEBUG` for per-trade skip details |
+| `REFRESH_BALANCE_BEFORE_BUY` | `1` = refresh collateral cache before USDC check |
+
+At startup the bot logs **`CLOB signer=`** and **`funder=`** — `funder` must match your Polymarket proxy if USDC is there; otherwise balance reads as ~0.
+
+## Troubleshooting
+
+### `invalid signature` (HTTP 400)
+
+The CLOB rejected the signed order: the **EIP-712** payload does not match how Polymarket expects your account to trade.
+
+1. **`PRIVATE_KEY`** — Must be the key **Polymarket issued / linked** for API trading (e.g. export from Polymarket settings for Magic, or the wallet you connected).
+2. **`POLYMARKET_FUNDER`** — Must be the **proxy address** shown in the Polymarket UI (profile / deposit), not a random EOA.
+3. **`POLYMARKET_SIGNATURE_TYPE`** — **`0`** = **EOA only** (signer and funder are the same address; raw private key / MetaMask account with no Polymarket proxy). **`2`** = **browser wallet + Polymarket proxy (Gnosis Safe)** — then **`POLYMARKET_FUNDER` must be the proxy** from the UI, **not** the same as the signing EOA. If **`funder == signer`** in logs and you use type **`2`**, you will usually get **`invalid signature`** → switch to **`0`** or set the real proxy as funder. **`1`** = email / Magic proxy.
+
+Official reference: [Signature types](https://docs.polymarket.com/developers/CLOB/trades/overview#signature-types).
+
+### `no match` (exception from `create_market_order`)
+
+The CLOB order book has **no path to fill your FOK market order**: empty side, or **not enough displayed depth** to cover the USD (BUY) or shares (SELL) at any price. Common right after the leader trades or on thin markets. The bot logs this as a skip and continues.
 
 ## Operational notes
 
+- **Log output:** At default **`LOG_LEVEL=INFO`** you should see **`filled BUY|SELL … order=…`** only when the CLOB **accepts** an order. If you never see `filled` but see the **`invalid signature`** warning once, wallet config is still wrong — the bot is **not** buying until that is fixed. Use **`LOG_LEVEL=DEBUG`** to see each submit attempt (`submit …`).
 - **Lag:** Polling + FOK execution means you will often be slower than the leader; orders can fail if the book moves.
 - **High activity:** If the leader prints more than `TRADE_POLL_LIMIT` fills between polls, older fills may never appear in the window—increase limit and/or poll more often.
 - **Security:** Treat `.env` as a secret; use a dedicated hot wallet with limited funds if possible.

@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 from dotenv import load_dotenv
@@ -134,13 +134,11 @@ def _log_insufficient_balance_hint_once(settings: Settings) -> None:
     )
 
 
-def _parse_optional_evm_address(env_name: str, raw: str | None) -> str | None:
-    """Return normalized 0x-prefixed lowercase address, or None if unset."""
-    if not raw:
-        return None
+def _validate_evm_address(env_name: str, raw: str) -> str:
+    """Validate a single 0x + 40-hex EVM address; return normalized lowercase hex."""
     s = raw.strip()
     if not s:
-        return None
+        raise SystemExit(f"{env_name}: empty address")
     if not s.startswith("0x"):
         raise SystemExit(f"{env_name} must start with 0x (got {s[:24]}…)")
     body = s[2:]
@@ -151,7 +149,7 @@ def _parse_optional_evm_address(env_name: str, raw: str | None) -> str | None:
     if len(body) == 64:
         raise SystemExit(
             f"{env_name} has 64 hex characters after 0x — that is a **private key** length. "
-            "Set it to your Polymarket **proxy wallet address** (40 hex chars / 20 bytes), not PRIVATE_KEY."
+            "Use a 20-byte wallet address (40 hex chars), not PRIVATE_KEY."
         )
     if len(body) != 40:
         raise SystemExit(
@@ -159,6 +157,46 @@ def _parse_optional_evm_address(env_name: str, raw: str | None) -> str | None:
             f"(got {len(body)}). Example: 0xabc…def (42 chars total)."
         )
     return "0x" + body.lower()
+
+
+def _parse_optional_evm_address(env_name: str, raw: str | None) -> str | None:
+    """Return normalized 0x-prefixed lowercase address, or None if unset."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    return _validate_evm_address(env_name, s)
+
+
+def _parse_target_wallets(env_name: str, raw: str) -> tuple[str, ...]:
+    """Comma- or newline-separated leader addresses; dedupe preserving order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in raw.replace("\n", ",").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        addr = _validate_evm_address(env_name, p)
+        lk = addr.lower()
+        if lk not in seen:
+            seen.add(lk)
+            out.append(addr)
+    if not out:
+        raise SystemExit(f"{env_name}: at least one 0x address required")
+    return tuple(out)
+
+
+def _flatten_cli_targets(targets_cli: list[str] | None) -> str | None:
+    if not targets_cli:
+        return None
+    parts: list[str] = []
+    for item in targets_cli:
+        for seg in item.replace("\n", ",").split(","):
+            s = seg.strip()
+            if s:
+                parts.append(s)
+    return ",".join(parts) if parts else None
 
 
 def _log_invalid_signature_hint_once() -> None:
@@ -197,9 +235,22 @@ def fetch_leader_trades(
     return data
 
 
+def fetch_leader_trades_multi(
+    client: httpx.Client,
+    users: Sequence[str],
+    limit: int,
+    taker_only: bool,
+) -> list[dict[str, Any]]:
+    """Fetch up to `limit` trades per leader; merge (caller sorts / dedupes by fingerprint)."""
+    merged: list[dict[str, Any]] = []
+    for user in users:
+        merged.extend(fetch_leader_trades(client, user, limit, taker_only))
+    return merged
+
+
 @dataclass
 class Settings:
-    target: str
+    targets: tuple[str, ...]
     private_key: str | None
     signature_type: int
     funder: str | None
@@ -650,8 +701,9 @@ def run_loop(settings: Settings) -> None:
         clob = build_clob_client(settings)
 
     log.info(
-        "copy_trader target=%s scale=%s dry_run=%s bootstrapped=%s market_filter=%s auto_redeem=%s",
-        settings.target,
+        "copy_trader targets=%d [%s…] scale=%s dry_run=%s bootstrapped=%s market_filter=%s auto_redeem=%s",
+        len(settings.targets),
+        ",".join(t[:10] for t in settings.targets),
         settings.scale,
         settings.dry_run,
         bootstrapped,
@@ -668,8 +720,8 @@ def run_loop(settings: Settings) -> None:
 
     while True:
         try:
-            trades = fetch_leader_trades(
-                http, settings.target, settings.trade_limit, settings.taker_only
+            trades = fetch_leader_trades_multi(
+                http, settings.targets, settings.trade_limit, settings.taker_only
             )
             by_time = sorted(trades, key=lambda t: int(t.get("timestamp") or 0))
 
@@ -756,15 +808,15 @@ def replay_last_trades(settings: Settings, limit: int) -> None:
 
         clob = ClobClient(CLOB_HOST, chain_id=CHAIN_ID)
 
-    trades = fetch_leader_trades(
-        http, settings.target, limit, settings.taker_only
+    trades = fetch_leader_trades_multi(
+        http, settings.targets, limit, settings.taker_only
     )
     by_time = sorted(trades, key=lambda t: int(t.get("timestamp") or 0))
 
     log.info(
-        "replay: mirroring %d trade(s) for %s (dry_run=%s)",
+        "replay: mirroring %d trade(s) for %d leader(s) (dry_run=%s)",
         len(by_time),
-        settings.target,
+        len(settings.targets),
         settings.dry_run,
     )
 
@@ -781,18 +833,27 @@ def replay_last_trades(settings: Settings, limit: int) -> None:
 
 
 def settings_from_env(
-    target_override: str | None = None,
+    targets_cli: list[str] | None = None,
     *,
     require_copy_target: bool = True,
 ) -> Settings:
     load_dotenv()
 
-    target = target_override or os.environ.get("COPY_TARGET_WALLET", "").strip()
-    if not target:
-        if require_copy_target:
-            print("Set COPY_TARGET_WALLET or pass --target 0x…", file=sys.stderr)
-            raise SystemExit(2)
-        target = "0x0000000000000000000000000000000000000001"
+    cli_raw = _flatten_cli_targets(targets_cli)
+    env_raw = os.environ.get("COPY_TARGET_WALLET", "").strip()
+
+    if cli_raw:
+        targets = _parse_target_wallets("COPY_TARGET_WALLET (--target)", cli_raw)
+    elif env_raw:
+        targets = _parse_target_wallets("COPY_TARGET_WALLET", env_raw)
+    elif require_copy_target:
+        print(
+            "Set COPY_TARGET_WALLET (comma-separated 0x…) or pass --target (repeat or CSV)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    else:
+        targets = ("0x0000000000000000000000000000000000000001",)
 
     dry = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
     pk = os.environ.get("PRIVATE_KEY", "").strip() or None
@@ -841,7 +902,7 @@ def settings_from_env(
         )
 
     return Settings(
-        target=target,
+        targets=targets,
         private_key=pk,
         signature_type=sig,
         funder=funder,

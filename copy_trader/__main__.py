@@ -30,8 +30,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Polymarket copy trader (CLOB mirror)")
     p.add_argument(
         "--target",
+        dest="targets_cli",
+        action="append",
         metavar="0x…",
-        help="Leader wallet (proxy) to copy; overrides COPY_TARGET_WALLET",
+        help="Leader wallet(s) to copy; repeat flag or use comma-separated in one value. "
+        "Overrides COPY_TARGET_WALLET.",
     )
     p.add_argument(
         "--replay",
@@ -59,7 +62,7 @@ def main() -> None:
     )
     args = p.parse_args()
     settings = settings_from_env(
-        args.target,
+        args.targets_cli,
         require_copy_target=not (args.check or args.redeem_once),
     )
     if args.check:

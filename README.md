@@ -7,7 +7,7 @@ This is **not** official Polymarket software. Use at your own risk; prediction m
 ## How it works
 
 1. **Bootstrap:** On the first run (empty state file), the bot records every trade in the current API page as “seen” and **does not copy** them.
-2. **Loop:** Every `POLL_INTERVAL_SEC` it fetches up to `TRADE_POLL_LIMIT` recent trades for `COPY_TARGET_WALLET`, sorts by time, and for each **new** fingerprint it runs `mirror_trade`.
+2. **Loop:** Every `POLL_INTERVAL_SEC` it fetches up to `TRADE_POLL_LIMIT` recent trades **per** leader in `COPY_TARGET_WALLET` (comma-separated list), merges them, sorts by time, and for each **new** fingerprint it runs `mirror_trade`.
 3. **Mirror:** Optional **market filter** (default: weather/temperature keywords), **size** from `COPY_SCALE`, optional `MIN_BUY_USD` / `MAX_BUY_USD`, **min size** from the book, optional **balance/allowance** pre-check, then **sign + post** an FOK market order.
 
 Skipped trades (filter, min size, balance, errors) are still marked **seen** so they are not retried every poll.
@@ -34,10 +34,12 @@ python3 -m venv .venv
 .venv/bin/python -m copy_trader
 ```
 
-Override leader for one run:
+Override leader(s) for one run (`--target` can repeat or use commas):
 
 ```bash
-.venv/bin/python -m copy_trader --target 0xLeaderAddress
+.venv/bin/python -m copy_trader --target 0xLeaderA
+.venv/bin/python -m copy_trader --target 0xA,0xB
+.venv/bin/python -m copy_trader --target 0xA --target 0xB
 ```
 
 One-shot redeem (no copy loop; `COPY_TARGET_WALLET` optional):
@@ -48,7 +50,7 @@ One-shot redeem (no copy loop; `COPY_TARGET_WALLET` optional):
 
 ### Replay last N trades once
 
-Fetches the latest **N** rows from the Data API (default **100**), runs the same mirror path as the live loop (filters, sizing, balance check), and **merges** fingerprints into `STATE_FILE` so the next poll does not fire duplicates.
+Fetches the latest **N** rows **per** leader from the Data API (default **100** each), merges, runs the same mirror path as the live loop (filters, sizing, balance check), and **merges** fingerprints into `STATE_FILE` so the next poll does not fire duplicates.
 
 ```bash
 .venv/bin/python -m copy_trader --replay       # last 100
@@ -83,7 +85,7 @@ Copy `**.env.example**` to `**.env**` and adjust. Important entries:
 
 | Variable                                 | Notes                                                                                         |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `COPY_TARGET_WALLET`                     | Leader proxy address to copy                                                                  |
+| `COPY_TARGET_WALLET`                     | One or more leader proxy addresses, comma-separated (deduped)                                 |
 | `PRIVATE_KEY`                            | Your signer (omit or use `DRY_RUN=1` for poll-only)                                           |
 | `POLYMARKET_SIGNATURE_TYPE`              | `0` EOA, `1` Magic, `2` browser/Gnosis Safe proxy (common)                                    |
 | `POLYMARKET_FUNDER`                      | Proxy that holds USDC if different from signer default                                        |

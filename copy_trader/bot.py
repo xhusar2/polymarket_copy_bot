@@ -223,6 +223,18 @@ class Settings:
     polygon_rpc_url: str | None
     redeem_state_path: Path
     redeem_state_cap: int
+    poly_builder_key: str | None
+    poly_builder_secret: str | None
+    poly_builder_passphrase: str | None
+    relayer_url: str | None
+
+
+def _has_builder_relayer_creds(settings: Settings) -> bool:
+    return bool(
+        settings.poly_builder_key
+        and settings.poly_builder_secret
+        and settings.poly_builder_passphrase
+    )
 
 
 def build_clob_client(settings: Settings):
@@ -590,11 +602,18 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
 
 
 def redeem_winnings_once(settings: Settings) -> None:
-    """Single pass: Data API redeemable positions + on-chain redeemPositions (EOA only)."""
+    """Single pass: redeemable positions via relayer (Builder creds) or Polygon RPC (EOA)."""
     if not settings.private_key:
         raise SystemExit("PRIVATE_KEY required for --redeem-once")
-    if not settings.polygon_rpc_url and not settings.dry_run:
-        raise SystemExit("POLYGON_RPC_URL required for --redeem-once (or set DRY_RUN=1 to dry-run)")
+    if (
+        not settings.polygon_rpc_url
+        and not settings.dry_run
+        and not _has_builder_relayer_creds(settings)
+    ):
+        raise SystemExit(
+            "Set POLYGON_RPC_URL for RPC redeem, or POLY_BUILDER_API_KEY+POLY_BUILDER_SECRET+"
+            "POLY_BUILDER_PASSPHRASE for gasless relayer (or DRY_RUN=1)"
+        )
     headers = {"User-Agent": settings.user_agent}
     http = httpx.Client(headers=headers, timeout=30.0)
     try:
@@ -609,6 +628,10 @@ def redeem_winnings_once(settings: Settings) -> None:
             redeem_state_path=settings.redeem_state_path,
             redeemed_cap=settings.redeem_state_cap,
             http=http,
+            poly_builder_key=settings.poly_builder_key,
+            poly_builder_secret=settings.poly_builder_secret,
+            poly_builder_passphrase=settings.poly_builder_passphrase,
+            relayer_url=settings.relayer_url,
         )
     finally:
         http.close()
@@ -677,12 +700,14 @@ def run_loop(settings: Settings) -> None:
             now = time.time()
             if now - last_auto_redeem >= settings.auto_redeem_interval_sec:
                 last_auto_redeem = now
-                if not settings.polygon_rpc_url:
+                if not settings.polygon_rpc_url and not _has_builder_relayer_creds(
+                    settings
+                ):
                     if not _auto_redeem_no_rpc_logged:
                         _auto_redeem_no_rpc_logged = True
                         log.warning(
-                            "AUTO_REDEEM=1 but POLYGON_RPC_URL is unset — set a Polygon HTTPS RPC "
-                            "(Infura, Alchemy, publicnode, etc.)"
+                            "AUTO_REDEEM=1 but neither POLYGON_RPC_URL nor Builder relayer "
+                            "creds (POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE)"
                         )
                 elif settings.private_key:
                     try:
@@ -693,10 +718,14 @@ def run_loop(settings: Settings) -> None:
                             funder=settings.funder,
                             user_agent=settings.user_agent,
                             dry_run=settings.dry_run,
-                            polygon_rpc_url=settings.polygon_rpc_url,
+                            polygon_rpc_url=settings.polygon_rpc_url or "",
                             redeem_state_path=settings.redeem_state_path,
                             redeemed_cap=settings.redeem_state_cap,
                             http=http,
+                            poly_builder_key=settings.poly_builder_key,
+                            poly_builder_secret=settings.poly_builder_secret,
+                            poly_builder_passphrase=settings.poly_builder_passphrase,
+                            relayer_url=settings.relayer_url,
                         )
                     except Exception as e:
                         log.warning("auto_redeem pass failed: %s", e)
@@ -848,4 +877,11 @@ def settings_from_env(
             os.environ.get("REDEEM_STATE_FILE", "redeem_state.json")
         ),
         redeem_state_cap=int(os.environ.get("REDEEM_STATE_CAP", "2000")),
+        poly_builder_key=os.environ.get("POLY_BUILDER_API_KEY", "").strip() or None,
+        poly_builder_secret=os.environ.get("POLY_BUILDER_SECRET", "").strip() or None,
+        poly_builder_passphrase=os.environ.get(
+            "POLY_BUILDER_PASSPHRASE", ""
+        ).strip()
+        or None,
+        relayer_url=os.environ.get("RELAYER_URL", "").strip() or None,
     )

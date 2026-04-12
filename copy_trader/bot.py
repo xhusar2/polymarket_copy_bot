@@ -116,6 +116,17 @@ def _is_insufficient_balance_error(exc: BaseException) -> bool:
     )
 
 
+def _is_no_orderbook_error(exc: BaseException) -> bool:
+    """CLOB has no book for this outcome token (resolved/closed/unsupported on CLOB)."""
+    if isinstance(exc, PolyApiException):
+        t = _poly_error_text(exc).lower()
+        if "no orderbook" in t:
+            return True
+        # Some deployments return 404 with a generic body
+        return exc.status_code == 404 and "token" in t
+    return "no orderbook" in str(exc).lower()
+
+
 def _log_insufficient_balance_hint_once(settings: Settings) -> None:
     global _insufficient_balance_hint
     if _insufficient_balance_hint:
@@ -547,7 +558,18 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
     leader_price = float(trade["price"])
     scaled_shares = leader_size * settings.scale
 
-    book = clob.get_order_book(token_id)
+    try:
+        book = clob.get_order_book(token_id)
+    except PolyApiException as e:
+        if _is_no_orderbook_error(e):
+            log.debug(
+                "skip %s: no CLOB orderbook token=%s… — %s",
+                side,
+                token_id[:20],
+                _poly_error_text(e)[:120],
+            )
+            return
+        raise
     min_sz = float(book.min_order_size or 0)
 
     if side == "SELL":

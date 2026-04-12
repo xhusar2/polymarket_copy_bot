@@ -8,7 +8,7 @@ This is **not** official Polymarket software. Use at your own risk; prediction m
 
 1. **Bootstrap:** On the first run (empty state file), the bot records every trade in the current API page as “seen” and **does not copy** them.
 2. **Loop:** Every `POLL_INTERVAL_SEC` it fetches up to `TRADE_POLL_LIMIT` recent trades **per** leader in `COPY_TARGET_WALLET` (comma-separated list), merges them, sorts by time, and for each **new** fingerprint it runs `mirror_trade`.
-3. **Mirror:** Optional **market filter** (default: weather/temperature keywords), **size** from `COPY_SCALE`, optional `MIN_BUY_USD` / `MAX_BUY_USD`, **min size** from the book, optional **balance/allowance** pre-check, then **sign + post** an FOK market order.
+3. **Mirror:** Optional **market filter** (default: weather/temperature keywords), **size** from `COPY_SCALE`, optional `MIN_BUY_USD` / `MAX_BUY_USD`, **min size** from the book, optional **balance/allowance** pre-check, then **sign + post** a market order (`COPY_ORDER_TYPE`: **`FOK`** or **`FAK`**).
 
 Skipped trades (filter, min size, balance, errors) are still marked **seen** so they are not retried every poll.
 
@@ -90,6 +90,7 @@ Copy `**.env.example**` to `**.env**` and adjust. Important entries:
 | `POLYMARKET_SIGNATURE_TYPE`              | `0` EOA, `1` Magic, `2` browser/Gnosis Safe proxy (common)                                    |
 | `POLYMARKET_FUNDER`                      | Proxy that holds USDC if different from signer default                                        |
 | `COPY_SCALE`                             | Multiplier on leader size / notional                                                          |
+| `COPY_ORDER_TYPE`                        | `FOK` (default) full fill or nothing; `FAK` partial fill + cancel rest (better on thin books) |
 | `MAX_BUY_USD`                            | Optional cap per mirrored **BUY** (USDC)                                                      |
 | `MIN_BUY_USD`                            | Optional floor — skip **BUY** if notional after cap is below this (USDC)                      |
 | `COPY_MARKET_FILTER`                     | `weather` (default), `all`, or `keywords` (+ `COPY_MARKET_KEYWORDS`)                          |

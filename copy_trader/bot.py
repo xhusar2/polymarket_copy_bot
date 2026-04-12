@@ -289,6 +289,17 @@ class Settings:
     poly_builder_secret: str | None
     poly_builder_passphrase: str | None
     relayer_url: str | None
+    market_order_type: str  # FOK | FAK
+
+
+def _resolve_market_order_type(settings: Settings):
+    """CLOB market order execution: FOK = all-or-nothing, FAK = fill available then cancel rest."""
+    from py_clob_client.clob_types import OrderType
+
+    name = (settings.market_order_type or "FOK").strip().upper()
+    if name == "FAK":
+        return OrderType.FAK
+    return OrderType.FOK
 
 
 def _has_builder_relayer_creds(settings: Settings) -> bool:
@@ -538,7 +549,7 @@ def trade_matches_market_filter(trade: dict[str, Any], settings: Settings) -> bo
 
 
 def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.clob_types import MarketOrderArgs
 
     token_id = str(trade["asset"])
     side = str(trade["side"]).upper()
@@ -622,31 +633,43 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
 
     if settings.dry_run:
         log.info(
-            "[dry_run] would %s %s | %s",
+            "[dry_run] would %s %s (%s) | %s",
             side,
             f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
+            settings.market_order_type,
             (title or "")[:50],
         )
         return
 
+    ot = _resolve_market_order_type(settings)
     mo = MarketOrderArgs(
         token_id=token_id,
         amount=amount,
         side=side,
         price=0,
-        order_type=OrderType.FOK,
+        order_type=ot,
     )
     try:
         signed = clob.create_market_order(mo)
-        resp = clob.post_order(signed, orderType=OrderType.FOK)
+        resp = clob.post_order(signed, orderType=ot)
         oid = resp.get("orderID") if isinstance(resp, dict) else resp
-        log.info(
-            "filled %s %s | order=%s | %s",
-            side,
-            f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
-            oid,
-            (title or "")[:55],
-        )
+        amt_s = f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh"
+        if settings.market_order_type.upper() == "FAK":
+            log.info(
+                "filled %s %s (FAK target; check UI for actual size) | order=%s | %s",
+                side,
+                amt_s,
+                oid,
+                (title or "")[:55],
+            )
+        else:
+            log.info(
+                "filled %s %s | order=%s | %s",
+                side,
+                amt_s,
+                oid,
+                (title or "")[:55],
+            )
         log.debug("posted %s", resp)
     except PolyApiException as e:
         if _is_invalid_signature_error(e):
@@ -665,9 +688,10 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
     except Exception as e:
         # py-clob-client: empty book or not enough ask depth to fill FOK BUY/SELL notional
         if str(e) == "no match":
-            log.warning(
-                "skip %s FOK: no liquidity to match size (empty book or insufficient depth) token=%s…",
+            log.debug(
+                "skip %s %s: no book / no liquidity to price market order token=%s…",
                 side,
+                settings.market_order_type,
                 token_id[:20],
             )
             return
@@ -723,10 +747,11 @@ def run_loop(settings: Settings) -> None:
         clob = build_clob_client(settings)
 
     log.info(
-        "copy_trader targets=%d [%s…] scale=%s dry_run=%s bootstrapped=%s market_filter=%s auto_redeem=%s",
+        "copy_trader targets=%d [%s…] scale=%s order_type=%s dry_run=%s bootstrapped=%s market_filter=%s auto_redeem=%s",
         len(settings.targets),
         ",".join(t[:10] for t in settings.targets),
         settings.scale,
+        settings.market_order_type,
         settings.dry_run,
         bootstrapped,
         settings.market_filter_mode,
@@ -854,6 +879,14 @@ def replay_last_trades(settings: Settings, limit: int) -> None:
     log.info("replay: done; state saved (%d fingerprints in store)", len(seen))
 
 
+def _parse_market_order_type_env() -> str:
+    raw = os.environ.get("COPY_ORDER_TYPE", "FOK").strip().upper()
+    if raw not in ("FOK", "FAK"):
+        log.warning("unknown COPY_ORDER_TYPE=%r — use FOK or FAK; defaulting to FOK", raw)
+        return "FOK"
+    return raw
+
+
 def settings_from_env(
     targets_cli: list[str] | None = None,
     *,
@@ -967,4 +1000,5 @@ def settings_from_env(
         ).strip()
         or None,
         relayer_url=os.environ.get("RELAYER_URL", "").strip() or None,
+        market_order_type=_parse_market_order_type_env(),
     )

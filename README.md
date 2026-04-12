@@ -40,6 +40,12 @@ Override leader for one run:
 .venv/bin/python -m copy_trader --target 0xLeaderAddress
 ```
 
+One-shot redeem (no copy loop; `COPY_TARGET_WALLET` optional):
+
+```bash
+.venv/bin/python -m copy_trader --redeem-once
+```
+
 ### Replay last N trades once
 
 Fetches the latest **N** rows from the Data API (default **100**), runs the same mirror path as the live loop (filters, sizing, balance check), and **merges** fingerprints into `STATE_FILE` so the next poll does not fire duplicates.
@@ -95,8 +101,18 @@ Copy **`.env.example`** to **`.env`** and adjust. Important entries:
 | `DATA_API_USER_AGENT` | Required for Data API (403 without a UA) |
 | `LOG_LEVEL` | `INFO` (default) or `DEBUG` for per-trade skip details |
 | `REFRESH_BALANCE_BEFORE_BUY` | `1` = refresh collateral cache before USDC check |
+| `AUTO_REDEEM` | `1` = periodically call CTF **`redeemPositions`** on Polygon for resolved markets (see below) |
+| `AUTO_REDEEM_INTERVAL_SEC` | Seconds between redeem passes (default `3600`) |
+| `POLYGON_RPC_URL` | HTTPS RPC for Polygon (required for on-chain redeem) |
+| `REDEEM_STATE_FILE` / `REDEEM_STATE_CAP` | Track already-redeemed `conditionId`s (default `redeem_state.json`, cap `2000`) |
 
 At startup the bot logs **`CLOB signer=`** and **`funder=`** — `funder` must match your Polymarket proxy if USDC is there; otherwise balance reads as ~0.
+
+### Auto-redeem (resolved winners)
+
+`AUTO_REDEEM=1` uses the [Data API `positions?redeemable=true`](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user) for your wallet, then submits [`redeemPositions`](https://docs.polymarket.com/developers/CTF/redeem) on the Conditional Tokens contract. **Limitation:** txs are signed with **`PRIVATE_KEY`** and sent **`from` the signer address**. That only matches Polymarket **EOA** accounts (`POLYMARKET_SIGNATURE_TYPE=0`, no separate proxy funder). If **`POLYMARKET_FUNDER`** is your Polymarket **proxy**, outcome tokens sit on the proxy — this bot **cannot** auto-redeem them (would need Safe / relayer). Use **`python -m copy_trader --redeem-once`** for a manual pass; you still need **`POLYGON_RPC_URL`** and **MATIC** on the EOA for gas.
+
+Docker: mount **`redeem_state.json`** with your state volume if you want redeem dedup to persist.
 
 ## Troubleshooting
 

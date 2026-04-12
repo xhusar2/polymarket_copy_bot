@@ -3,3 +3,4 @@
 __pycache__/
 *.pyc
 copy_state.json
+redeem_state.json

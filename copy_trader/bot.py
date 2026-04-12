@@ -21,6 +21,7 @@ _logged_usdc_zero_hint = False
 _invalid_signature_hint = False
 # One-time hint for HTTP 400 insufficient balance / allowance on post_order.
 _insufficient_balance_hint = False
+_auto_redeem_no_rpc_logged = False
 
 DATA_API = "https://data-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -217,6 +218,11 @@ class Settings:
     refresh_balance_before_sell: bool
     market_filter_mode: str
     market_filter_keywords: tuple[str, ...]
+    auto_redeem: bool
+    auto_redeem_interval_sec: float
+    polygon_rpc_url: str | None
+    redeem_state_path: Path
+    redeem_state_cap: int
 
 
 def build_clob_client(settings: Settings):
@@ -583,7 +589,34 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
         raise
 
 
+def redeem_winnings_once(settings: Settings) -> None:
+    """Single pass: Data API redeemable positions + on-chain redeemPositions (EOA only)."""
+    if not settings.private_key:
+        raise SystemExit("PRIVATE_KEY required for --redeem-once")
+    if not settings.polygon_rpc_url and not settings.dry_run:
+        raise SystemExit("POLYGON_RPC_URL required for --redeem-once (or set DRY_RUN=1 to dry-run)")
+    headers = {"User-Agent": settings.user_agent}
+    http = httpx.Client(headers=headers, timeout=30.0)
+    try:
+        from .redeem import redeem_winnings_pass
+
+        redeem_winnings_pass(
+            private_key=settings.private_key,
+            funder=settings.funder,
+            user_agent=settings.user_agent,
+            dry_run=settings.dry_run,
+            polygon_rpc_url=settings.polygon_rpc_url or "",
+            redeem_state_path=settings.redeem_state_path,
+            redeemed_cap=settings.redeem_state_cap,
+            http=http,
+        )
+    finally:
+        http.close()
+
+
 def run_loop(settings: Settings) -> None:
+    global _auto_redeem_no_rpc_logged
+
     headers = {"User-Agent": settings.user_agent}
     http = httpx.Client(headers=headers, timeout=30.0)
     seen = load_seen(settings.state_path, settings.seen_cap)
@@ -594,18 +627,21 @@ def run_loop(settings: Settings) -> None:
         clob = build_clob_client(settings)
 
     log.info(
-        "copy_trader target=%s scale=%s dry_run=%s bootstrapped=%s market_filter=%s",
+        "copy_trader target=%s scale=%s dry_run=%s bootstrapped=%s market_filter=%s auto_redeem=%s",
         settings.target,
         settings.scale,
         settings.dry_run,
         bootstrapped,
         settings.market_filter_mode,
+        settings.auto_redeem,
     )
 
     if clob is None:
         from py_clob_client.client import ClobClient
 
         clob = ClobClient(CLOB_HOST, chain_id=CHAIN_ID)
+
+    last_auto_redeem = 0.0
 
     while True:
         try:
@@ -636,6 +672,34 @@ def run_loop(settings: Settings) -> None:
 
         except Exception as e:
             log.exception("poll error: %s", e)
+
+        if settings.auto_redeem:
+            now = time.time()
+            if now - last_auto_redeem >= settings.auto_redeem_interval_sec:
+                last_auto_redeem = now
+                if not settings.polygon_rpc_url:
+                    if not _auto_redeem_no_rpc_logged:
+                        _auto_redeem_no_rpc_logged = True
+                        log.warning(
+                            "AUTO_REDEEM=1 but POLYGON_RPC_URL is unset — set a Polygon HTTPS RPC "
+                            "(Infura, Alchemy, publicnode, etc.)"
+                        )
+                elif settings.private_key:
+                    try:
+                        from .redeem import redeem_winnings_pass
+
+                        redeem_winnings_pass(
+                            private_key=settings.private_key,
+                            funder=settings.funder,
+                            user_agent=settings.user_agent,
+                            dry_run=settings.dry_run,
+                            polygon_rpc_url=settings.polygon_rpc_url,
+                            redeem_state_path=settings.redeem_state_path,
+                            redeemed_cap=settings.redeem_state_cap,
+                            http=http,
+                        )
+                    except Exception as e:
+                        log.warning("auto_redeem pass failed: %s", e)
 
         time.sleep(settings.poll_interval)
 
@@ -774,4 +838,14 @@ def settings_from_env(
         in ("1", "true", "yes"),
         market_filter_mode=mf,
         market_filter_keywords=kw_tuple,
+        auto_redeem=os.environ.get("AUTO_REDEEM", "").lower()
+        in ("1", "true", "yes"),
+        auto_redeem_interval_sec=float(
+            os.environ.get("AUTO_REDEEM_INTERVAL_SEC", "3600")
+        ),
+        polygon_rpc_url=os.environ.get("POLYGON_RPC_URL", "").strip() or None,
+        redeem_state_path=Path(
+            os.environ.get("REDEEM_STATE_FILE", "redeem_state.json")
+        ),
+        redeem_state_cap=int(os.environ.get("REDEEM_STATE_CAP", "2000")),
     )

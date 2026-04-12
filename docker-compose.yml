@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       STATE_FILE: /data/copy_state.json
+      REDEEM_STATE_FILE: /data/redeem_state.json
     volumes:
       - trader_state:/data
 

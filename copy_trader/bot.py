@@ -21,6 +21,8 @@ _logged_usdc_zero_hint = False
 _invalid_signature_hint = False
 # One-time hint for HTTP 400 insufficient balance / allowance on post_order.
 _insufficient_balance_hint = False
+# One-time hint for HTTP 403 CLOB regional geoblock on post_order.
+_geoblock_hint = False
 _auto_redeem_no_rpc_logged = False
 
 DATA_API = "https://data-api.polymarket.com"
@@ -113,6 +115,31 @@ def _is_insufficient_balance_error(exc: BaseException) -> bool:
         t = str(exc).lower()
     return "not enough balance" in t or (
         "insufficient" in t and ("balance" in t or "allowance" in t)
+    )
+
+
+def _is_geoblock_error(exc: BaseException) -> bool:
+    if isinstance(exc, PolyApiException) and exc.status_code == 403:
+        t = _poly_error_text(exc).lower()
+        return (
+            "region" in t
+            or "geoblock" in t
+            or "restricted" in t
+            or "trading restricted" in t
+        )
+    s = str(exc).lower()
+    return "trading restricted" in s and "region" in s
+
+
+def _log_geoblock_hint_once() -> None:
+    global _geoblock_hint
+    if _geoblock_hint:
+        return
+    _geoblock_hint = True
+    log.warning(
+        "CLOB 403 — trading geoblocked for your region/IP. Orders will not post until you use an "
+        "allowed network (see https://docs.polymarket.com/developers/CLOB/geoblock). "
+        "Further post_order failures log at DEBUG only."
     )
 
 
@@ -683,6 +710,10 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 side,
                 _poly_error_text(e) if isinstance(e, PolyApiException) else e,
             )
+            return
+        if _is_geoblock_error(e):
+            _log_geoblock_hint_once()
+            log.debug("skip %s post_order geoblocked: %s", side, _poly_error_text(e))
             return
         raise
     except Exception as e:

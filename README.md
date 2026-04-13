@@ -93,6 +93,7 @@ Copy `**.env.example**` to `**.env**` and adjust. Important entries:
 | `COPY_ORDER_TYPE`                        | `FOK` (default) full fill or nothing; `FAK` partial fill + cancel rest (better on thin books) |
 | `MAX_BUY_USD`                            | Optional cap per mirrored **BUY** (USDC)                                                      |
 | `MIN_BUY_USD`                            | Optional floor — skip **BUY** if notional after cap is below this (USDC)                      |
+| `MIN_COPY_PRICE` / `MAX_COPY_PRICE`     | Optional BUY odds gate from leader fill price (0..1); skip BUYs outside this range            |
 | `COPY_MARKET_FILTER`                     | `weather` (default), `all`, or `keywords` (+ `COPY_MARKET_KEYWORDS`)                          |
 | `POLL_INTERVAL_SEC`                      | Seconds between polls                                                                         |
 | `TRADE_POLL_LIMIT`                       | Max trades per request (API allows up to 10k; bursts can be missed if too low)                |

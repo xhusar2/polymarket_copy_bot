@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -301,6 +302,8 @@ class Settings:
     seen_cap: int
     max_buy_usd: float | None
     min_buy_usd: float | None
+    min_copy_price: float | None
+    max_copy_price: float | None
     user_agent: str
     skip_balance_check: bool
     refresh_balance_before_buy: bool
@@ -594,6 +597,29 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
 
     leader_size = float(trade["size"])
     leader_price = float(trade["price"])
+    if side == "BUY":
+        if (
+            settings.min_copy_price is not None
+            and leader_price < settings.min_copy_price - 1e-12
+        ):
+            log.debug(
+                "skip BUY below MIN_COPY_PRICE token=%s price=%.4f min=%.4f",
+                token_id[:16],
+                leader_price,
+                settings.min_copy_price,
+            )
+            return
+        if (
+            settings.max_copy_price is not None
+            and leader_price > settings.max_copy_price + 1e-12
+        ):
+            log.debug(
+                "skip BUY above MAX_COPY_PRICE token=%s price=%.4f max=%.4f",
+                token_id[:16],
+                leader_price,
+                settings.max_copy_price,
+            )
+            return
     scaled_shares = leader_size * settings.scale
 
     try:
@@ -918,6 +944,19 @@ def _parse_market_order_type_env() -> str:
     return raw
 
 
+def _parse_price_threshold_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a float between 0 and 1")
+    if not math.isfinite(v) or v < 0 or v > 1:
+        raise SystemExit(f"{name} must be between 0 and 1")
+    return v
+
+
 def settings_from_env(
     targets_cli: list[str] | None = None,
     *,
@@ -976,6 +1015,8 @@ def settings_from_env(
     min_buy = (
         float(os.environ["MIN_BUY_USD"]) if os.environ.get("MIN_BUY_USD") else None
     )
+    min_copy_price = _parse_price_threshold_env("MIN_COPY_PRICE")
+    max_copy_price = _parse_price_threshold_env("MAX_COPY_PRICE")
     if (
         max_buy is not None
         and min_buy is not None
@@ -985,6 +1026,15 @@ def settings_from_env(
             "MIN_BUY_USD (%s) > MAX_BUY_USD (%s) — every BUY will be skipped",
             min_buy,
             max_buy,
+        )
+    if (
+        min_copy_price is not None
+        and max_copy_price is not None
+        and min_copy_price > max_copy_price + 1e-12
+    ):
+        raise SystemExit(
+            "MIN_COPY_PRICE cannot be greater than MAX_COPY_PRICE "
+            "(both are in [0, 1])"
         )
 
     return Settings(
@@ -1001,6 +1051,8 @@ def settings_from_env(
         seen_cap=int(os.environ.get("SEEN_CAP", "8000")),
         max_buy_usd=max_buy,
         min_buy_usd=min_buy,
+        min_copy_price=min_copy_price,
+        max_copy_price=max_copy_price,
         user_agent=os.environ.get("DATA_API_USER_AGENT", "PolymarketCopyTrader/1.0"),
         skip_balance_check=os.environ.get("SKIP_BALANCE_CHECK", "").lower()
         in ("1", "true", "yes"),

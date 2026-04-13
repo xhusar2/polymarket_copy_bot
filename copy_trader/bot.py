@@ -96,6 +96,43 @@ def save_seen(path: Path, seen: set[str], cap: int) -> None:
     path.write_text(json.dumps({"seen": trimmed}, indent=0))
 
 
+def _append_trade_event(
+    settings,
+    *,
+    action: str,
+    side: str | None = None,
+    token_id: str | None = None,
+    title: str | None = None,
+    reason: str | None = None,
+    leader_price: float | None = None,
+    leader_size: float | None = None,
+    amount: float | None = None,
+    order_id: str | None = None,
+) -> None:
+    path = settings.trade_log_file
+    if path is None:
+        return
+    event = {
+        "ts": int(time.time()),
+        "action": action,
+        "side": side,
+        "token_id": token_id,
+        "title": title,
+        "reason": reason,
+        "leader_price": leader_price,
+        "leader_size": leader_size,
+        "amount": amount,
+        "order_type": settings.market_order_type,
+        "order_id": order_id,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except OSError as e:
+        log.debug("trade log append failed (%s): %s", path, e)
+
+
 def _poly_error_text(exc: PolyApiException) -> str:
     m = exc.error_msg
     if isinstance(m, dict):
@@ -320,6 +357,7 @@ class Settings:
     poly_builder_passphrase: str | None
     relayer_url: str | None
     market_order_type: str  # FOK | FAK
+    trade_log_file: Path | None
 
 
 def _resolve_market_order_type(settings: Settings):
@@ -583,15 +621,32 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
 
     token_id = str(trade["asset"])
     side = str(trade["side"]).upper()
+    title = trade.get("title") or ""
     if side not in ("BUY", "SELL"):
         log.warning("skip unknown side %s", side)
+        _append_trade_event(
+            settings,
+            action="skip",
+            side=side,
+            token_id=token_id,
+            title=title,
+            reason="unknown_side",
+        )
         return
 
     if not trade_matches_market_filter(trade, settings):
         log.debug(
             "skip market filter (%s) title=%s",
             settings.market_filter_mode,
-            (trade.get("title") or "")[:80],
+            title[:80],
+        )
+        _append_trade_event(
+            settings,
+            action="skip",
+            side=side,
+            token_id=token_id,
+            title=title,
+            reason="market_filter",
         )
         return
 
@@ -608,6 +663,16 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 leader_price,
                 settings.min_copy_price,
             )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="below_min_copy_price",
+                leader_price=leader_price,
+                leader_size=leader_size,
+            )
             return
         if (
             settings.max_copy_price is not None
@@ -618,6 +683,16 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 token_id[:16],
                 leader_price,
                 settings.max_copy_price,
+            )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="above_max_copy_price",
+                leader_price=leader_price,
+                leader_size=leader_size,
             )
             return
     scaled_shares = leader_size * settings.scale
@@ -632,6 +707,16 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 token_id[:20],
                 _poly_error_text(e)[:120],
             )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="no_orderbook",
+                leader_price=leader_price,
+                leader_size=leader_size,
+            )
             return
         raise
     min_sz = float(book.min_order_size or 0)
@@ -645,6 +730,17 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 amount,
                 min_sz,
             )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="below_min_order_size",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
+            )
             return
     else:
         notion = leader_size * leader_price * settings.scale
@@ -657,6 +753,17 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 notion,
                 settings.min_buy_usd,
             )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="below_min_buy_usd",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=notion,
+            )
             return
         if min_sz:
             min_notional = min_sz * leader_price
@@ -667,14 +774,35 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                     notion,
                     min_notional,
                 )
+                _append_trade_event(
+                    settings,
+                    action="skip",
+                    side=side,
+                    token_id=token_id,
+                    title=title,
+                    reason="below_min_notional",
+                    leader_price=leader_price,
+                    leader_size=leader_size,
+                    amount=notion,
+                )
                 return
         amount = notion
 
     if not settings.dry_run:
         if not trade_affordable(clob, side, token_id, amount, settings):
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="balance_or_allowance_precheck",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
+            )
             return
 
-    title = trade.get("title") or ""
     log.debug(
         "submit %s %s shares~=%.4f token=%s… | %s",
         side,
@@ -691,6 +819,16 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
             f"${amount:.2f}" if side == "BUY" else f"{amount:.4f} sh",
             settings.market_order_type,
             (title or "")[:50],
+        )
+        _append_trade_event(
+            settings,
+            action="dry_run",
+            side=side,
+            token_id=token_id,
+            title=title,
+            leader_price=leader_price,
+            leader_size=leader_size,
+            amount=amount,
         )
         return
 
@@ -723,11 +861,33 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 oid,
                 (title or "")[:55],
             )
+        _append_trade_event(
+            settings,
+            action="filled",
+            side=side,
+            token_id=token_id,
+            title=title,
+            leader_price=leader_price,
+            leader_size=leader_size,
+            amount=amount,
+            order_id=str(oid),
+        )
         log.debug("posted %s", resp)
     except PolyApiException as e:
         if _is_invalid_signature_error(e):
             _log_invalid_signature_hint_once()
             log.debug("post_order: %s", e)
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="invalid_signature",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
+            )
             return
         if _is_insufficient_balance_error(e):
             _log_insufficient_balance_hint_once(settings)
@@ -736,10 +896,32 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 side,
                 _poly_error_text(e) if isinstance(e, PolyApiException) else e,
             )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="insufficient_balance_or_allowance_post_order",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
+            )
             return
         if _is_geoblock_error(e):
             _log_geoblock_hint_once()
             log.debug("skip %s post_order geoblocked: %s", side, _poly_error_text(e))
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="geoblocked",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
+            )
             return
         raise
     except Exception as e:
@@ -750,6 +932,17 @@ def mirror_trade(clob, trade: dict[str, Any], settings: Settings) -> None:
                 side,
                 settings.market_order_type,
                 token_id[:20],
+            )
+            _append_trade_event(
+                settings,
+                action="skip",
+                side=side,
+                token_id=token_id,
+                title=title,
+                reason="no_match_liquidity",
+                leader_price=leader_price,
+                leader_size=leader_size,
+                amount=amount,
             )
             return
         raise
@@ -1017,6 +1210,7 @@ def settings_from_env(
     )
     min_copy_price = _parse_price_threshold_env("MIN_COPY_PRICE")
     max_copy_price = _parse_price_threshold_env("MAX_COPY_PRICE")
+    trade_log_file = os.environ.get("TRADE_LOG_FILE", "").strip() or None
     if (
         max_buy is not None
         and min_buy is not None
@@ -1084,4 +1278,5 @@ def settings_from_env(
         or None,
         relayer_url=os.environ.get("RELAYER_URL", "").strip() or None,
         market_order_type=_parse_market_order_type_env(),
+        trade_log_file=Path(trade_log_file) if trade_log_file else None,
     )

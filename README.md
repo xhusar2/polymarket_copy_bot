@@ -105,6 +105,7 @@ Copy `**.env.example**` to `**.env**` and adjust. Important entries:
 | `REFRESH_BALANCE_BEFORE_SELL`            | `1` to refresh conditional balance cache before SELL check                                    |
 | `DATA_API_USER_AGENT`                    | Required for Data API (403 without a UA)                                                      |
 | `LOG_LEVEL`                              | `INFO` (default) or `DEBUG` for per-trade skip details                                        |
+| `TRADE_LOG_FILE`                         | Optional JSONL append-only trade event log (fills/skips/errors), e.g. `/data/trade_log.jsonl` |
 | `REFRESH_BALANCE_BEFORE_BUY`             | `1` = refresh collateral cache before USDC check                                              |
 | `AUTO_REDEEM`                            | `1` = periodic redeem for resolved markets (relayer or RPC — see below)                       |
 | `AUTO_REDEEM_INTERVAL_SEC`               | Seconds between redeem passes (default `3600`)                                                |
@@ -114,7 +115,7 @@ Copy `**.env.example**` to `**.env**` and adjust. Important entries:
 | `REDEEM_STATE_FILE` / `REDEEM_STATE_CAP` | Track already-redeemed `conditionId`s (default `redeem_state.json`, cap `2000`)               |
 
 
-At startup the bot logs **`CLOB signer=`** and **`funder=`** — `funder` must match your Polymarket proxy if USDC is there; otherwise balance reads as ~0.
+At startup the bot logs **`CLOB signer=`** and **`funder=`** — `funder` must match your Polymarket proxy if USDC is there; otherwise balance reads as ~0. If `TRADE_LOG_FILE` is set, each mirror decision appends one JSON object per line (`action`, `reason`, `token_id`, `leader_price`, `amount`, `order_id`, etc.).
 
 ### Auto-redeem (resolved winners)
 
